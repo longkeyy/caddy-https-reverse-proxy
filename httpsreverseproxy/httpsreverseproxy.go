@@ -2,9 +2,9 @@ package httpsreverseproxy
 
 import (
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"time"
 
@@ -48,52 +48,61 @@ func (h HTTPSReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return err
 	}
 
-	// Create a custom director function
-	director := func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
+	// Create a new request
+	outReq := new(http.Request)
+	*outReq = *r // This only does a shallow copy, so we need to deep copy some fields
 
-		// Remove X-Forwarded-For header
-		req.Header.Del("X-Forwarded-For")
+	outReq.URL = target
+	outReq.URL.Path = r.URL.Path
+	outReq.URL.RawQuery = r.URL.RawQuery
+	outReq.Host = target.Host
+	outReq.RequestURI = "" // This must be reset when serving a request with the client
 
-		// Remove other headers that might reveal proxy existence
-		req.Header.Del("X-Forwarded-Proto")
-		req.Header.Del("X-Real-IP")
-
-		// Remove hop-by-hop headers
-		for _, h := range hopHeaders {
-			req.Header.Del(h)
+	// Deep-copy headers
+	outReq.Header = make(http.Header)
+	for k, v := range r.Header {
+		if k != "X-Forwarded-For" && k != "X-Real-Ip" {
+			outReq.Header[k] = v
 		}
 	}
 
-	// Create a custom ModifyResponse function
-	modifyResponse := func(resp *http.Response) error {
-		// Remove hop-by-hop headers
-		for _, h := range hopHeaders {
-			resp.Header.Del(h)
+	// Remove hop-by-hop headers
+	for _, h := range hopHeaders {
+		outReq.Header.Del(h)
+	}
+
+	// Create a custom transport
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Note: This is insecure and should be used carefully
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Send the request
+	resp, err := transport.RoundTrip(outReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Copy headers from response
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
 		}
-		return nil
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Director:       director,
-		ModifyResponse: modifyResponse,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Note: This is insecure and should be used carefully
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
+	// Send response
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 
-	proxy.ServeHTTP(w, r)
 	return nil
 }
 
